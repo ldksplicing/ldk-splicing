@@ -610,7 +610,10 @@ mod tests {
 		fn handle_splice_ack(&self, _their_node_id: &PublicKey, _msg: &SpliceAck) {}
 		fn handle_splice_locked(&self, _their_node_id: &PublicKey, _msg: &SpliceLocked) {}
 		fn handle_splice_created(&self, _their_node_id: &PublicKey, _msg: &SpliceCreated) {}
-		fn handle_splice_signed(&self, _their_node_id: &PublicKey, _msg: &SpliceSigned) {}
+		fn handle_splice_comm_signed(&self, their_node_id: &PublicKey, msg: &SpliceCommSigned) {}
+		fn handle_splice_comm_ack(&self, their_node_id: &PublicKey, msg: &SpliceCommAck) {}
+		fn handle_splice_signed(&self, their_node_id: &PublicKey, msg: &SpliceSigned) {}
+		fn handle_splice_signed_ack(&self, _their_node_id: &PublicKey, _msg: &SpliceSignedAck) {}
 		fn handle_tx_add_input(&self, _their_node_id: &PublicKey, _msg: &TxAddInput) {}
 		fn handle_tx_add_output(&self, _their_node_id: &PublicKey, _msg: &TxAddOutput) {}
 		fn handle_tx_remove_input(&self, _their_node_id: &PublicKey, _msg: &TxRemoveInput) {}
@@ -636,7 +639,7 @@ mod tests {
 		fn handle_error(&self, _their_node_id: &PublicKey, _msg: &ErrorMessage) {}
 		fn provided_node_features(&self) -> NodeFeatures { NodeFeatures::empty() }
 		fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures { InitFeatures::empty() }
-		fn get_genesis_hashes(&self) -> Option<Vec<ChainHash>> {
+		fn get_chain_hashes(&self) -> Option<Vec<ChainHash>> {
 			Some(vec![ChainHash::using_genesis_block(Network::Testnet)])
 		}
 	}

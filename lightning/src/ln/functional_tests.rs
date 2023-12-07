@@ -41,7 +41,7 @@ use crate::util::config::{ChannelHandshakeConfig, UserConfig, MaxDustHTLCExposur
 use bitcoin::hash_types::{BlockHash, Txid};
 use bitcoin::blockdata::script::{Builder, Script};
 use bitcoin::blockdata::opcodes;
-use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::blockdata::constants::ChainHash;
 use bitcoin::network::constants::Network;
 use bitcoin::{PackedLockTime, Sequence, Transaction, TxIn, TxOut, Witness};
 use bitcoin::OutPoint as BitcoinOutPoint;
@@ -66,22 +66,43 @@ use crate::ln::chan_utils::CommitmentTransaction;
 
 use super::channel::UNFUNDED_CHANNEL_AGE_LIMIT_TICKS;
 
-// Return the two pubkeys from the script
-fn verify_multisig_redeem_script(script: &Vec<u8>) -> (Vec<u8>, Vec<u8>) {
-	let expected_len = 71;
-	assert_eq!(script.len(), expected_len);
-	assert_eq!(script[0], 0x52); // 2
-	assert_eq!(script[1], 0x21); // pubkey len
-	let key1 = script[2..2+33].to_vec();
-	assert_eq!(script[1+1+ 33], 0x21); // pubkey len
-	let key2 = script[36..36+33].to_vec();
-	println!("{} {}", hex::encode(&key1), hex::encode(&key2));
-	assert_eq!(script[1+1+33+1+33], 0x52); // 2
-	assert_eq!(script[1+1+33+1+33+1], 0xae); // OP_CHECKMULTISIG
-	if key1 > key2 {
-		panic!("The two pubkeys should in lexigraphical order! {} {}", hex::encode(&key1), hex::encode(&key2));
-	}
-	(key1, key2)
+// Create a 2-of-2 multisig redeem script. Return the script, and the two keys in the order they appear in the script.
+fn create_multisig_redeem_script(key1: &PublicKey, key2: &PublicKey) -> (Script, PublicKey, PublicKey) {
+	let (smaller_key, larger_key) = if key1.serialize() < key2.serialize() {
+		(key1, key2)
+	} else {
+		(key2, key1)
+	};
+	let script = Builder::new()
+		.push_opcode(opcodes::all::OP_PUSHNUM_2)
+		.push_slice(&smaller_key.serialize()[..])
+		.push_slice(&larger_key.serialize()[..])
+		.push_opcode(opcodes::all::OP_PUSHNUM_2)
+		.push_opcode(opcodes::all::OP_CHECKMULTISIG)
+		.into_script();
+	(script, smaller_key.clone(), larger_key.clone())
+}
+
+// Create an output script for a 2-of-2 multisig.
+fn create_multisig_output_script(key1: &PublicKey, key2: &PublicKey) -> Script {
+	let (redeem_script, _k1, _k2) = create_multisig_redeem_script(key1, key2);
+	Builder::new()
+		.push_opcode(opcodes::all::OP_PUSHBYTES_0)
+		.push_slice(&redeem_script.wscript_hash().as_ref())
+		.into_script()
+}
+
+// Verify a 2-of-2 multisig redeem script. Return the same keys, but in the order as they appear in the script
+fn verify_multisig_redeem_script(script: &Vec<u8>, exp_key_1: &PublicKey, exp_key_2: &PublicKey)  -> (PublicKey, PublicKey) {
+	let (exp_script,exp_smaller_key, exp_larger_key) = create_multisig_redeem_script(exp_key_1, exp_key_2);
+	assert_eq!(hex::encode(script), hex::encode(exp_script.as_bytes()));
+	(exp_smaller_key, exp_larger_key)
+}
+
+// Verify a 2-of-2 multisig output script.
+fn verify_multisig_output_script(script: &Script, exp_key_1: &PublicKey, exp_key_2: &PublicKey) {
+	let exp_script = create_multisig_output_script(exp_key_1, exp_key_2);
+	assert_eq!(hex::encode(script), hex::encode(exp_script.as_bytes()));
 }
 
 // Get the funding key of a node towards another node
@@ -92,6 +113,27 @@ fn get_funding_key(node: &Node, counterparty_node: &Node, channel_id: &ChannelId
 		|phase| if let ChannelPhase::Funded(chan) = phase { Some(chan) } else { None }
 	).flatten().unwrap();
 	local_chan.get_signer().as_ref().pubkeys().funding_pubkey
+}
+
+/// Verify the funding output of a funding tx
+fn verify_funding_output(funding_tx: &Transaction, value: u64, funding_key_1: &PublicKey, funding_key_2: &PublicKey) {
+	// find the output with the given value
+	let mut funding_output_opt: Option<&TxOut> = None;
+	for o in &funding_tx.output {
+		if o.value == value {
+			funding_output_opt = Some(o);
+		}
+	}
+	if funding_output_opt.is_none() {
+		panic!("Funding output not found, no output with value {}", value);
+	}
+	let act_script = &funding_output_opt.unwrap().script_pubkey;
+	verify_multisig_output_script(&act_script, funding_key_1, funding_key_2);
+}
+
+/// Do checks on a funding tx
+fn verify_funding_tx(funding_tx: &Transaction, value: u64, funding_key_1: &PublicKey, funding_key_2: &PublicKey) {
+	verify_funding_output(funding_tx, value, funding_key_1, funding_key_2);
 }
 
 /// Simple open channel flow
@@ -111,67 +153,70 @@ fn test_channel_open_simple() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(cfg)]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
+	// Initiator and Acceptor node indices. Order matters, we want the case when initiator pubkey is larger.
+	let i = 0;
+	let a = 1;
+
 	// Instantiate channel parameters where we push the maximum msats given our
 	// funding satoshis
 	let channel_value_sat = 100000; // same as funding satoshis
 	let push_msat = 0;
 
 	// Have node0 initiate a channel to node1 with aforementioned parameters
-	let _res = nodes[0].node.create_channel(nodes[1].node.get_our_node_id(), channel_value_sat, push_msat, 42, None).unwrap();
+	let _res = nodes[i].node.create_channel(nodes[a].node.get_our_node_id(), channel_value_sat, push_msat, 42, None).unwrap();
 
 	// Extract the channel open message from node0 to node1
-	let open_channel_message = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, nodes[1].node.get_our_node_id());
+	let open_channel_message = get_event_msg!(nodes[i], MessageSendEvent::SendOpenChannel, nodes[a].node.get_our_node_id());
 
-	let _res = nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel_message.clone());
+	let _res = nodes[a].node.handle_open_channel(&nodes[i].node.get_our_node_id(), &open_channel_message.clone());
 	// Extract the accept channel message from node1 to node0
-	let accept_channel_message = get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, nodes[0].node.get_our_node_id());
-	let _res = nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), &accept_channel_message.clone());
+	let accept_channel_message = get_event_msg!(nodes[a], MessageSendEvent::SendAcceptChannel, nodes[i].node.get_our_node_id());
+	let _res = nodes[i].node.handle_accept_channel(&nodes[a].node.get_our_node_id(), &accept_channel_message.clone());
 	// Note: FundingGenerationReady emitted, checked and used below
-	let (temporary_channel_id, funding_tx, _funding_output) = create_funding_transaction(&nodes[0], &nodes[1].node.get_our_node_id(), channel_value_sat, 42);
+	let (temporary_channel_id, funding_tx, _funding_output) = create_funding_transaction(&nodes[i], &nodes[a].node.get_our_node_id(), channel_value_sat, 42);
 	assert_eq!(funding_tx.encode().len(), 55);
 
 	// Funding transation created, provide it
-	let _res = nodes[0].node.funding_transaction_generated(&temporary_channel_id, &nodes[1].node.get_our_node_id(), funding_tx.clone()).unwrap();
+	let _res = nodes[i].node.funding_transaction_generated(&temporary_channel_id, &nodes[a].node.get_our_node_id(), funding_tx.clone()).unwrap();
 
-	let funding_created_message = get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, nodes[1].node.get_our_node_id());
-	let _res = nodes[1].node.handle_funding_created(&nodes[0].node.get_our_node_id(), &funding_created_message);
+	let funding_created_message = get_event_msg!(nodes[i], MessageSendEvent::SendFundingCreated, nodes[a].node.get_our_node_id());
+	let _res = nodes[a].node.handle_funding_created(&nodes[i].node.get_our_node_id(), &funding_created_message);
 
-	let funding_signed_message = get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, nodes[0].node.get_our_node_id());
-	let _res = nodes[0].node.handle_funding_signed(&nodes[1].node.get_our_node_id(), &funding_signed_message);
+	let funding_signed_message = get_event_msg!(nodes[a], MessageSendEvent::SendFundingSigned, nodes[i].node.get_our_node_id());
+	let _res = nodes[i].node.handle_funding_signed(&nodes[a].node.get_our_node_id(), &funding_signed_message);
 	// Take new channel ID
 	let channel_id = funding_signed_message.channel_id;
 
 	// Check that funding transaction has been broadcasted
-	assert_eq!(chanmon_cfgs[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
-	let broadcasted_funding_tx = chanmon_cfgs[0].tx_broadcaster.txn_broadcasted.lock().unwrap()[0].clone();
+	assert_eq!(chanmon_cfgs[i].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let broadcasted_funding_tx = chanmon_cfgs[i].tx_broadcaster.txn_broadcasted.lock().unwrap()[0].clone();
 	assert_eq!(broadcasted_funding_tx.encode().len(), 55);
 	assert_eq!(broadcasted_funding_tx.txid(), funding_tx.txid());
 	assert_eq!(broadcasted_funding_tx.encode(), funding_tx.encode());
-	// TODO check for multisig output, script
 
-	check_added_monitors!(nodes[0], 1);
-	let _ev = get_event!(nodes[0], Event::ChannelPending);
-	check_added_monitors!(nodes[1], 1);
-	let _ev = get_event!(nodes[1], Event::ChannelPending);
+	check_added_monitors!(nodes[i], 1);
+	let _ev = get_event!(nodes[i], Event::ChannelPending);
+	check_added_monitors!(nodes[a], 1);
+	let _ev = get_event!(nodes[a], Event::ChannelPending);
 
-	confirm_transaction(&nodes[0], &broadcasted_funding_tx);
-	let channel_ready_message = get_event_msg!(nodes[0], MessageSendEvent::SendChannelReady, nodes[1].node.get_our_node_id());
+	confirm_transaction(&nodes[i], &broadcasted_funding_tx);
+	let channel_ready_message = get_event_msg!(nodes[i], MessageSendEvent::SendChannelReady, nodes[a].node.get_our_node_id());
 
-	confirm_transaction(&nodes[1], &broadcasted_funding_tx);
-	let channel_ready_message2 = get_event_msg!(nodes[1], MessageSendEvent::SendChannelReady, nodes[0].node.get_our_node_id());
+	confirm_transaction(&nodes[a], &broadcasted_funding_tx);
+	let channel_ready_message2 = get_event_msg!(nodes[a], MessageSendEvent::SendChannelReady, nodes[i].node.get_our_node_id());
 
-	let _res = nodes[1].node.handle_channel_ready(&nodes[0].node.get_our_node_id(), &channel_ready_message);
-	let _ev = get_event!(nodes[1], Event::ChannelReady);
-	let _announcement_signatures = get_event_msg!(nodes[1], MessageSendEvent::SendAnnouncementSignatures, nodes[0].node.get_our_node_id());
+	let _res = nodes[a].node.handle_channel_ready(&nodes[i].node.get_our_node_id(), &channel_ready_message);
+	let _ev = get_event!(nodes[a], Event::ChannelReady);
+	let _announcement_signatures = get_event_msg!(nodes[a], MessageSendEvent::SendAnnouncementSignatures, nodes[i].node.get_our_node_id());
 
-	let _res = nodes[0].node.handle_channel_ready(&nodes[1].node.get_our_node_id(), &channel_ready_message2);
-	let _ev = get_event!(nodes[0], Event::ChannelReady);
-	let _announcement_signatures = get_event_msg!(nodes[0], MessageSendEvent::SendAnnouncementSignatures, nodes[1].node.get_our_node_id());
+	let _res = nodes[i].node.handle_channel_ready(&nodes[a].node.get_our_node_id(), &channel_ready_message2);
+	let _ev = get_event!(nodes[i], Event::ChannelReady);
+	let _announcement_signatures = get_event_msg!(nodes[i], MessageSendEvent::SendAnnouncementSignatures, nodes[a].node.get_our_node_id());
 
 	// check channel capacity and other parameters
-	assert_eq!(nodes[0].node.list_channels().len(), 1);
+	assert_eq!(nodes[i].node.list_channels().len(), 1);
+	let channel = &nodes[i].node.list_channels()[0];
 	{
-		let channel = &nodes[0].node.list_channels()[0];
 		assert!(channel.is_usable);
 		assert!(channel.is_channel_ready);
 		assert_eq!(channel.channel_value_satoshis, channel_value_sat);
@@ -180,33 +225,40 @@ fn test_channel_open_simple() {
 		assert_eq!(channel.confirmations.unwrap(), 10);
 	}
 
+	let initiator_funding_key = get_funding_key(&nodes[i], &nodes[a], &channel.channel_id);
+	let acceptor_funding_key = get_funding_key(&nodes[a], &nodes[i], &channel.channel_id);
+
+	verify_funding_tx(&broadcasted_funding_tx, channel_value_sat, &initiator_funding_key, &acceptor_funding_key);
+	assert_eq!(broadcasted_funding_tx.encode().to_hex(),
+		"0000000000010001a08601000000000022002034c0cc0ad0dd5fe61dcf7ef58f995e3d34f8dbd24aa2a6fae68fefe102bf025c00000000");
+
 	// Normal operation
 	// TODO payment WIP
 	// WIP let _pay_amount = 3000;
-	// WIP utils::create_invoice_from_channelmanager(nodes[1].node, nodes[1].keys_manager, nodes[1].logger.clone(), Currency::Bitcoin, Some(pay_amount), "Test_payment_1".to_string(), 999999, None);
+	// WIP utils::create_invoice_from_channelmanager(nodes[a].node, nodes[a].keys_manager, nodes[a].logger.clone(), Currency::Bitcoin, Some(pay_amount), "Test_payment_1".to_string(), 999999, None);
 
 	// close channel
-	nodes[0].node.close_channel(&channel_id, &nodes[1].node.get_our_node_id()).unwrap();
-	let node0_shutdown_message = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node0_shutdown_message);
-	let nodes_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &nodes_1_shutdown);
-	let _ = get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, nodes[1].node.get_our_node_id());
+	nodes[i].node.close_channel(&channel_id, &nodes[a].node.get_our_node_id()).unwrap();
+	let node0_shutdown_message = get_event_msg!(nodes[i], MessageSendEvent::SendShutdown, nodes[a].node.get_our_node_id());
+	nodes[a].node.handle_shutdown(&nodes[i].node.get_our_node_id(), &node0_shutdown_message);
+	let nodes_1_shutdown = get_event_msg!(nodes[a], MessageSendEvent::SendShutdown, nodes[i].node.get_our_node_id());
+	nodes[i].node.handle_shutdown(&nodes[a].node.get_our_node_id(), &nodes_1_shutdown);
+	let _ = get_event_msg!(nodes[i], MessageSendEvent::SendClosingSigned, nodes[a].node.get_our_node_id());
 }
 
-fn verify_signature(msg: &Vec<u8>, sig: &Vec<u8>, pubkey: &Vec<u8>) -> Result<(), String> {
+fn verify_signature(msg: &Vec<u8>, sig: &Vec<u8>, pubkey: &PublicKey) -> Result<(), String> {
 	let m = Message::from_slice(&msg).unwrap();
 	let s = Signature::from_der(&sig).unwrap();
-	let pk = PublicKey::from_slice(&pubkey).unwrap();
 	let ctx = Secp256k1::new();
-	match ctx.verify_ecdsa(&m, &s, &pk) {
+	match ctx.verify_ecdsa(&m, &s, &pubkey) {
 		Ok(_) => Ok(()),
-		Err(e) => Err(format!("Signature verification failed! err {}  msg {}  sig {}  pk {}", e, hex::encode(&msg), hex::encode(&sig), hex::encode(&pubkey))),
+		Err(e) => Err(format!("Signature verification failed! err {}  msg {}  sig {}  pk {}", e, hex::encode(&msg), hex::encode(&sig), &pubkey.serialize().to_hex())),
 	}
 }
 
-/// #SPLICING Do checks on the splice funding tx
-fn verify_splice_funding_tx(splice_tx: &Transaction, prev_funding_txid: &Txid, prev_funding_value: u64) {
+/// #SPLICING
+/// Verify the previous funding input on a splicing funding transaction
+fn verify_splice_funding_input(splice_tx: &Transaction, prev_funding_txid: &Txid, prev_funding_value: u64, funding_key_1: &PublicKey, funding_key_2: &PublicKey) {
 	// check that the previous funding tx is an input
 	let mut prev_fund_input_idx: Option<usize> = None;
 	for idx in 0..splice_tx.input.len() {
@@ -237,7 +289,7 @@ fn verify_splice_funding_tx(splice_tx: &Transaction, prev_funding_txid: &Txid, p
 	if wit1_sig[wit1_sig.len()-1] != 1 || wit2_sig[wit2_sig.len()-1] != 1 {
 		panic!("Witness entries 2&3 should be signatures with SIGHASHALL! {} {}", hex::encode(wit1_sig), hex::encode(wit2_sig));
 	}
-	let (script_key1, script_key2) = verify_multisig_redeem_script(&witness[3]);
+	let (script_key1, script_key2) = verify_multisig_redeem_script(&witness[3], funding_key_1, funding_key_2);
 	let redeemscript = Script::from(witness[3].to_vec());
 	// check signatures, sigs are in same order as keys
 	let sighash = &SighashCache::new(splice_tx).segwit_signature_hash(prev_fund_input_idx.unwrap(), &redeemscript, prev_funding_value, EcdsaSighashType::All).unwrap()[..].to_vec();
@@ -249,6 +301,13 @@ fn verify_splice_funding_tx(splice_tx: &Transaction, prev_funding_txid: &Txid, p
 	if let Err(e2) = verify_signature(sighash, &sig2, &script_key2) {
 		panic!("Sig 2 check fails {}", e2);
 	}
+}
+
+/// #SPLICING
+/// Do checks on a splice funding tx
+fn verify_splice_funding_tx(splice_tx: &Transaction, prev_funding_txid: &Txid, funding_value: u64, prev_funding_value: u64, funding_key_1: &PublicKey, funding_key_2: &PublicKey) {
+	verify_splice_funding_input(splice_tx, prev_funding_txid, prev_funding_value, funding_key_1, funding_key_2);
+	verify_funding_output(splice_tx, funding_value, funding_key_1, funding_key_2);
 }
 
 /// #SPLICING Builds on test_channel_open_simple()
@@ -272,10 +331,6 @@ fn test_splice_in_simple() {
 	// Initiator and Acceptor node indices. Order matters, we want the case when initiator pubkey is larger.
 	let i = 0;
 	let a = 1;
-
-	// TODO check signer keys, not node IDs
-	// Although this condition depends on the test data only. we verify it here to make sure we test the case
-	// when the initiator pubkey is the 'larger', as this is the more error prone case (e.g. signature order)
 
 	// Instantiate channel parameters where we push the maximum msats given our funding satoshis
 	let channel_value_sat = 100000; // same as funding satoshis
@@ -313,7 +368,6 @@ fn test_splice_in_simple() {
 	assert_eq!(broadcasted_funding_tx.encode().len(), 55);
 	assert_eq!(broadcasted_funding_tx.txid(), funding_tx.txid());
 	assert_eq!(broadcasted_funding_tx.encode(), funding_tx.encode());
-	// TODO check for multisig output, script
 
 	check_added_monitors!(nodes[i], 1);
 	let _ev = get_event!(nodes[i], Event::ChannelPending);
@@ -346,10 +400,15 @@ fn test_splice_in_simple() {
 		assert_eq!(channel.confirmations.unwrap(), 10);
 	}
 
-	// Start of Splicing ...
-
 	let initiator_funding_key = get_funding_key(&nodes[i], &nodes[a], &channel.channel_id);
 	let acceptor_funding_key = get_funding_key(&nodes[a], &nodes[i], &channel.channel_id);
+
+	verify_funding_tx(&broadcasted_funding_tx, channel_value_sat, &initiator_funding_key, &acceptor_funding_key);
+	assert_eq!(broadcasted_funding_tx.encode().to_hex(),
+		"0000000000010001a08601000000000022002034c0cc0ad0dd5fe61dcf7ef58f995e3d34f8dbd24aa2a6fae68fefe102bf025c00000000");
+
+	// Start of Splicing ...
+
 	// Although this condition only depends on the test nodes used (and their order),
 	// we verify it here to make sure we test the case when the initiator funding pubkey is the 'larger',
 	// as this is the more error prone case (e.g. signature order)
@@ -383,8 +442,20 @@ fn test_splice_in_simple() {
 	let splice_created_message = get_event_msg!(nodes[i], MessageSendEvent::SendSpliceCreated, nodes[a].node.get_our_node_id());
 	let _res = nodes[a].node.handle_splice_created(&nodes[i].node.get_our_node_id(), &splice_created_message);
 
-	let splice_signed_message = get_event_msg!(nodes[a], MessageSendEvent::SendSpliceSigned, nodes[i].node.get_our_node_id());
-	let _res = nodes[i].node.handle_splice_signed(&nodes[a].node.get_our_node_id(), &splice_signed_message);
+	let tx_complete_message = get_event_msg!(nodes[a], MessageSendEvent::SendTxComplete, nodes[i].node.get_our_node_id());
+	let _res = nodes[i].node.handle_tx_complete(&nodes[a].node.get_our_node_id(), &tx_complete_message);
+
+	let splice_comm_signed_message = get_event_msg!(nodes[i], MessageSendEvent::SendSpliceCommSigned, nodes[a].node.get_our_node_id());
+	let _res = nodes[a].node.handle_splice_comm_signed(&nodes[i].node.get_our_node_id(), &splice_comm_signed_message);
+
+	let splice_comm_ack_message = get_event_msg!(nodes[a], MessageSendEvent::SendSpliceCommAck, nodes[i].node.get_our_node_id());
+	let _res = nodes[i].node.handle_splice_comm_ack(&nodes[a].node.get_our_node_id(), &splice_comm_ack_message);
+
+	let splice_signed_message = get_event_msg!(nodes[i], MessageSendEvent::SendSpliceSigned, nodes[a].node.get_our_node_id());
+	let _res = nodes[a].node.handle_splice_signed(&nodes[i].node.get_our_node_id(), &splice_signed_message);
+
+	let splice_signed_ack_message = get_event_msg!(nodes[a], MessageSendEvent::SendSpliceSignedAck, nodes[i].node.get_our_node_id());
+	let _res = nodes[i].node.handle_splice_signed_ack(&nodes[a].node.get_our_node_id(), &splice_signed_ack_message);
 
 	// Check that signed splice funding transaction has been broadcasted
 	assert_eq!(chanmon_cfgs[i].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 2);
@@ -392,10 +463,24 @@ fn test_splice_in_simple() {
 	assert!(broadcasted_splice_tx.encode().len() >= 314 && broadcasted_splice_tx.encode().len() <= 315);
 	assert_eq!(broadcasted_splice_tx.txid(), splice_tx.txid());
 	assert_ne!(broadcasted_splice_tx.encode(), splice_tx.encode());
-	verify_splice_funding_tx(&broadcasted_splice_tx, &broadcasted_funding_tx.txid(), channel_value_sat);
+	verify_splice_funding_tx(&broadcasted_splice_tx, &broadcasted_funding_tx.txid(), post_splice_channel_value, channel_value_sat, &initiator_funding_key, &acceptor_funding_key);
+	assert_eq!(broadcasted_splice_tx.encode().to_hex(),
+		"0000000000010174c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e0000000000fdffffff01c0d401000000000022002034c0cc0ad0dd5fe61dcf7ef58f995e3d34f8dbd24aa2a6fae68fefe102bf025c0400473044022021caaa9ce61a6f7213b1c5a35f5d34cf57ce2c38b9e38edde90d7a159ac77f42022037f1dce5947b36f5ae127bf174b9cff95fa9043ea581a9d47c25efab3b6c549301473044022019f6ee98b4a1fdbcbca241151483185c2a67d4d2ececfd59acc570df885ee3a80220508e4aa3a45ec859da0e3c112b4754142babe5435900267fe305d381f48a6fbb014752210307a78def56cba9fc4db22a25928181de538ee59ba1a475ae113af7790acd0db32103c21e841cbc0b48197d060c71e116c185fa0ac281b7d0aa5924f535154437ca3b52ae00000000");
 
 	check_added_monitors!(nodes[i], 1);
 	check_added_monitors!(nodes[a], 1);
+
+	// check that capacity has _not_ been changed yet
+	assert_eq!(nodes[i].node.list_channels().len(), 1);
+	{
+		let channel = &nodes[i].node.list_channels()[0];
+		assert!(!channel.is_usable); // TODO check
+		assert!(!channel.is_channel_ready); // TODO check
+		assert_eq!(channel.channel_value_satoshis, channel_value_sat);
+		assert_eq!(channel.outbound_capacity_msat, 100000000 - 1000000);
+		assert_eq!(channel.funding_txo.unwrap().txid, splice_tx.txid()); // TODO check
+		assert_eq!(channel.confirmations.unwrap(), 0); // TODO check
+	}
 
 	confirm_transaction(&nodes[i], &broadcasted_splice_tx);
 	let channel_ready_message = get_event_msg!(nodes[i], MessageSendEvent::SendChannelReady, nodes[a].node.get_our_node_id());
@@ -1707,9 +1792,9 @@ fn test_duplicate_htlc_different_direction_onchain() {
 	for e in events {
 		match e {
 			MessageSendEvent::BroadcastChannelUpdate { .. } => {},
-			MessageSendEvent::HandleError { node_id, action: msgs::ErrorAction::SendErrorMessage { ref msg } } => {
+			MessageSendEvent::HandleError { node_id, action: msgs::ErrorAction::DisconnectPeer { ref msg } } => {
 				assert_eq!(node_id, nodes[1].node.get_our_node_id());
-				assert_eq!(msg.data, "Channel closed because commitment or closing transaction was confirmed on chain.");
+				assert_eq!(msg.as_ref().unwrap().data, "Channel closed because commitment or closing transaction was confirmed on chain.");
 			},
 			MessageSendEvent::UpdateHTLCs { ref node_id, updates: msgs::CommitmentUpdate { ref update_add_htlcs, ref update_fulfill_htlcs, ref update_fail_htlcs, ref update_fail_malformed_htlcs, .. } } => {
 				assert!(update_add_htlcs.is_empty());
@@ -2234,7 +2319,7 @@ fn test_channel_reserve_holding_cell_htlcs() {
 	// attempt to send amt_msat > their_max_htlc_value_in_flight_msat
 	{
 		let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), TEST_FINAL_CLTV)
-			.with_bolt11_features(nodes[2].node.invoice_features()).unwrap().with_max_channel_saturation_power_of_half(0);
+			.with_bolt11_features(nodes[2].node.bolt11_invoice_features()).unwrap().with_max_channel_saturation_power_of_half(0);
 		let (mut route, our_payment_hash, _, our_payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, recv_value_0);
 		route.paths[0].hops.last_mut().unwrap().fee_msat += 1;
 		assert!(route.paths[0].hops.iter().rev().skip(1).all(|h| h.fee_msat == feemsat));
@@ -2259,7 +2344,7 @@ fn test_channel_reserve_holding_cell_htlcs() {
 		}
 
 		let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), TEST_FINAL_CLTV)
-			.with_bolt11_features(nodes[2].node.invoice_features()).unwrap().with_max_channel_saturation_power_of_half(0);
+			.with_bolt11_features(nodes[2].node.bolt11_invoice_features()).unwrap().with_max_channel_saturation_power_of_half(0);
 		let route = get_route!(nodes[0], payment_params, recv_value_0).unwrap();
 		let (payment_preimage, ..) = send_along_route(&nodes[0], route, &[&nodes[1], &nodes[2]], recv_value_0);
 		claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
@@ -2738,7 +2823,7 @@ fn channel_monitor_network_test() {
 			_ => panic!("Unexpected event"),
 		};
 		match events[1] {
-			MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { .. }, node_id } => {
+			MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { .. }, node_id } => {
 				assert_eq!(node_id, nodes[4].node.get_our_node_id());
 			},
 			_ => panic!("Unexpected event"),
@@ -2770,7 +2855,7 @@ fn channel_monitor_network_test() {
 			_ => panic!("Unexpected event"),
 		};
 		match events[1] {
-			MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { .. }, node_id } => {
+			MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { .. }, node_id } => {
 				assert_eq!(node_id, nodes[3].node.get_our_node_id());
 			},
 			_ => panic!("Unexpected event"),
@@ -3282,7 +3367,7 @@ fn test_htlc_on_chain_success() {
 	let nodes_0_event = remove_first_msg_event_to_node(&nodes[0].node.get_our_node_id(), &mut events);
 
 	match nodes_2_event {
-		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { .. }, node_id: _ } => {},
+		MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { .. }, node_id: _ } => {},
 		_ => panic!("Unexpected event"),
 	}
 
@@ -3727,7 +3812,7 @@ fn do_test_commitment_revoked_fail_backward_exhaustive(deliver_bs_raa: bool, use
 
 	let nodes_2_event = remove_first_msg_event_to_node(&nodes[2].node.get_our_node_id(), &mut events);
 	match nodes_2_event {
-		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { msg: msgs::ErrorMessage { channel_id, ref data } }, node_id: _ } => {
+		MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { msg: Some(msgs::ErrorMessage { channel_id, ref data }) }, node_id: _ } => {
 			assert_eq!(channel_id, chan_2.2);
 			assert_eq!(data.as_str(), "Channel closed because commitment or closing transaction was confirmed on chain.");
 		},
@@ -5289,7 +5374,7 @@ fn test_onchain_to_onchain_claim() {
 	let nodes_0_event = remove_first_msg_event_to_node(&nodes[0].node.get_our_node_id(), &mut msg_events);
 
 	match nodes_2_event {
-		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { .. }, node_id: _ } => {},
+		MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { .. }, node_id: _ } => {},
 		_ => panic!("Unexpected event"),
 	}
 
@@ -5359,7 +5444,7 @@ fn test_duplicate_payment_hash_one_failure_one_success() {
 	// script push size limit so that the below script length checks match
 	// ACCEPTED_HTLC_SCRIPT_WEIGHT.
 	let payment_params = PaymentParameters::from_node_id(nodes[3].node.get_our_node_id(), TEST_FINAL_CLTV - 40)
-		.with_bolt11_features(nodes[3].node.invoice_features()).unwrap();
+		.with_bolt11_features(nodes[3].node.bolt11_invoice_features()).unwrap();
 	let (route, _, _, _) = get_route_and_payment_hash!(nodes[0], nodes[3], payment_params, 800_000);
 	send_along_route_with_secret(&nodes[0], route, &[&[&nodes[1], &nodes[2], &nodes[3]]], 800_000, duplicate_payment_hash, payment_secret);
 
@@ -6199,8 +6284,8 @@ fn bolt2_open_channel_sending_node_checks_part2() {
 	assert!(node0_to_1_send_open_channel.to_self_delay==BREAKDOWN_TIMEOUT);
 
 	// BOLT #2 spec: Sending node must ensure the chain_hash value identifies the chain it wishes to open the channel within.
-	let chain_hash=genesis_block(Network::Testnet).header.block_hash();
-	assert_eq!(node0_to_1_send_open_channel.chain_hash,chain_hash);
+	let chain_hash = ChainHash::using_genesis_block(Network::Testnet);
+	assert_eq!(node0_to_1_send_open_channel.chain_hash, chain_hash);
 
 	// BOLT #2 spec: Sending node must set funding_pubkey, revocation_basepoint, htlc_basepoint, payment_basepoint, and delayed_payment_basepoint to valid DER-encoded, compressed, secp256k1 pubkeys.
 	assert!(PublicKey::from_slice(&node0_to_1_send_open_channel.funding_pubkey.serialize()).is_ok());
@@ -6650,7 +6735,7 @@ fn test_update_add_htlc_bolt2_sender_cltv_expiry_too_high() {
 	let _chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 0);
 
 	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(), 0)
-		.with_bolt11_features(nodes[1].node.invoice_features()).unwrap();
+		.with_bolt11_features(nodes[1].node.bolt11_invoice_features()).unwrap();
 	let (mut route, our_payment_hash, _, our_payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], payment_params, 100000000);
 	route.paths[0].hops.last_mut().unwrap().cltv_expiry_delta = 500000001;
 	unwrap_send_err!(nodes[0].node.send_payment_with_route(&route, our_payment_hash,
@@ -7596,8 +7681,8 @@ fn test_check_htlc_underpaying() {
 
 	let scorer = test_utils::TestScorer::new();
 	let random_seed_bytes = chanmon_cfgs[1].keys_manager.get_secure_random_bytes();
-	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(),
-		TEST_FINAL_CLTV).with_bolt11_features(nodes[1].node.invoice_features()).unwrap();
+	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(), TEST_FINAL_CLTV)
+		.with_bolt11_features(nodes[1].node.bolt11_invoice_features()).unwrap();
 	let route_params = RouteParameters::from_payment_params_and_value(payment_params, 10_000);
 	let route = get_route(&nodes[0].node.get_our_node_id(), &route_params, &nodes[0].network_graph.read_only(),
 		None, nodes[0].logger, &scorer, &Default::default(), &random_seed_bytes).unwrap();
@@ -7749,7 +7834,7 @@ fn test_bump_penalty_txn_on_revoked_commitment() {
 
 	let payment_preimage = route_payment(&nodes[0], &vec!(&nodes[1])[..], 3000000).0;
 	let payment_params = PaymentParameters::from_node_id(nodes[0].node.get_our_node_id(), 30)
-		.with_bolt11_features(nodes[0].node.invoice_features()).unwrap();
+		.with_bolt11_features(nodes[0].node.bolt11_invoice_features()).unwrap();
 	let (route,_, _, _) = get_route_and_payment_hash!(nodes[1], nodes[0], payment_params, 3000000);
 	send_along_route(&nodes[1], route, &vec!(&nodes[0])[..], 3000000);
 
@@ -7853,14 +7938,15 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 
 	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 59000000);
 	// Lock HTLC in both directions (using a slightly lower CLTV delay to provide timely RBF bumps)
-	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(), 50).with_bolt11_features(nodes[1].node.invoice_features()).unwrap();
+	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(), 50).with_bolt11_features(nodes[1].node.bolt11_invoice_features()).unwrap();
 	let scorer = test_utils::TestScorer::new();
 	let random_seed_bytes = chanmon_cfgs[1].keys_manager.get_secure_random_bytes();
 	let route_params = RouteParameters::from_payment_params_and_value(payment_params, 3_000_000);
 	let route = get_route(&nodes[0].node.get_our_node_id(), &route_params, &nodes[0].network_graph.read_only(), None,
 		nodes[0].logger, &scorer, &Default::default(), &random_seed_bytes).unwrap();
 	let payment_preimage = send_along_route(&nodes[0], route, &[&nodes[1]], 3_000_000).0;
-	let payment_params = PaymentParameters::from_node_id(nodes[0].node.get_our_node_id(), 50).with_bolt11_features(nodes[0].node.invoice_features()).unwrap();
+	let payment_params = PaymentParameters::from_node_id(nodes[0].node.get_our_node_id(), 50)
+		.with_bolt11_features(nodes[0].node.bolt11_invoice_features()).unwrap();
 	let route_params = RouteParameters::from_payment_params_and_value(payment_params, 3_000_000);
 	let route = get_route(&nodes[1].node.get_our_node_id(), &route_params, &nodes[1].network_graph.read_only(), None,
 		nodes[0].logger, &scorer, &Default::default(), &random_seed_bytes).unwrap();
@@ -8229,9 +8315,9 @@ fn test_channel_conf_timeout() {
 	let close_ev = nodes[1].node.get_and_clear_pending_msg_events();
 	assert_eq!(close_ev.len(), 1);
 	match close_ev[0] {
-		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { ref msg }, ref node_id } => {
+		MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { ref msg }, ref node_id } => {
 			assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-			assert_eq!(msg.data, "Channel closed because funding transaction failed to confirm within 2016 blocks");
+			assert_eq!(msg.as_ref().unwrap().data, "Channel closed because funding transaction failed to confirm within 2016 blocks");
 		},
 		_ => panic!("Unexpected event"),
 	}
@@ -9581,8 +9667,8 @@ fn test_invalid_funding_tx() {
 	assert_eq!(events_2.len(), 1);
 	if let MessageSendEvent::HandleError { node_id, action } = &events_2[0] {
 		assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-		if let msgs::ErrorAction::SendErrorMessage { msg } = action {
-			assert_eq!(msg.data, "Channel closed because of an exception: ".to_owned() + expected_err);
+		if let msgs::ErrorAction::DisconnectPeer { msg } = action {
+			assert_eq!(msg.as_ref().unwrap().data, "Channel closed because of an exception: ".to_owned() + expected_err);
 		} else { panic!(); }
 	} else { panic!(); }
 	assert_eq!(nodes[1].node.list_channels().len(), 0);
@@ -9763,7 +9849,7 @@ fn do_test_dup_htlc_second_rejected(test_for_second_fail_panic: bool) {
 	let _chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001);
 
 	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(), TEST_FINAL_CLTV)
-		.with_bolt11_features(nodes[1].node.invoice_features()).unwrap();
+		.with_bolt11_features(nodes[1].node.bolt11_invoice_features()).unwrap();
 	let route = get_route!(nodes[0], payment_params, 10_000).unwrap();
 
 	let (our_payment_preimage, our_payment_hash, our_payment_secret) = get_payment_preimage_hash!(&nodes[1]);
@@ -9872,7 +9958,7 @@ fn test_inconsistent_mpp_params() {
 	let chan_2_3 =create_announced_chan_between_nodes_with_value(&nodes, 2, 3, 100_000, 0);
 
 	let payment_params = PaymentParameters::from_node_id(nodes[3].node.get_our_node_id(), TEST_FINAL_CLTV)
-		.with_bolt11_features(nodes[3].node.invoice_features()).unwrap();
+		.with_bolt11_features(nodes[3].node.bolt11_invoice_features()).unwrap();
 	let mut route = get_route!(nodes[0], payment_params, 15_000_000).unwrap();
 	assert_eq!(route.paths.len(), 2);
 	route.paths.sort_by(|path_a, _| {
@@ -10383,7 +10469,7 @@ fn accept_busted_but_better_fee() {
 		MessageSendEvent::UpdateHTLCs { updates: msgs::CommitmentUpdate { ref update_fee, .. }, .. } => {
 			nodes[1].node.handle_update_fee(&nodes[0].node.get_our_node_id(), update_fee.as_ref().unwrap());
 			check_closed_event!(nodes[1], 1, ClosureReason::ProcessingError {
-				err: "Peer's feerate much too low. Actual: 1000. Our expected lower limit: 5000 (- 250)".to_owned() },
+				err: "Peer's feerate much too low. Actual: 1000. Our expected lower limit: 5000".to_owned() },
 				[nodes[0].node.get_our_node_id()], 100000);
 			check_closed_broadcast!(nodes[1], true);
 			check_added_monitors!(nodes[1], 1);
@@ -11021,7 +11107,7 @@ fn do_test_funding_and_commitment_tx_confirm_same_block(confirm_remote_commitmen
 	let mut msg_events = closing_node.node.get_and_clear_pending_msg_events();
 	assert_eq!(msg_events.len(), 1);
 	match msg_events.pop().unwrap() {
-		MessageSendEvent::HandleError { action: msgs::ErrorAction::SendErrorMessage { .. }, .. } => {},
+		MessageSendEvent::HandleError { action: msgs::ErrorAction::DisconnectPeer { .. }, .. } => {},
 		_ => panic!("Unexpected event"),
 	}
 	check_added_monitors(closing_node, 1);
